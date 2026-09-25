@@ -3,9 +3,10 @@
 ## Purpose
 
 Build a small, deterministic, project-neutral runtime that executes an already
-validated graph. It is a standalone component first. AppSDK may later consume it,
-but the first implementation must not depend on AppSDK crates, contracts, CLI,
-filesystem layout, or lifecycle records.
+compiled graph, accompanied by a small CLI for framework-level graph governance.
+It is a standalone component first. AppSDK may later consume it, but the first
+implementation must not depend on AppSDK crates, contracts, filesystem layout,
+or lifecycle records.
 
 The framework addresses repeated project-level execution mechanics: graph
 compilation and validation, operator resolution, ARC data transfer, lifecycle
@@ -20,6 +21,7 @@ The three owners have separate responsibilities:
 | Owner | Responsibility | Must not own |
 |---|---|---|
 | AppSDK / governance host | Define and admit project policy; validate design intent; bind evidence and project lifecycle; approve a compiled design for use | Operator business behavior or hidden runtime routing |
+| DAGpipe CLI | Validate and inspect graph topology and exact node-to-operator bindings using static built-in governance modules | Execute project operators, resolve project registries, or replace AppSDK approval/evidence governance |
 | Base framework | Compile the declared structure into an immutable graph; enforce declared dependencies/capabilities; execute that graph deterministically; record execution facts | Project policy, arbitrary design interpretation at runtime, or project-specific operators |
 | Project | Implement and register operators; provide graph configuration, schemas, and declared effect capabilities | Direct scheduling, graph mutation, undeclared ARC access, or state mutation |
 
@@ -44,6 +46,14 @@ Project graph definition + operator registry
 AppSDK may later provide the design/governance/evidence stages around this path.
 That integration is explicitly outside the standalone MVP.
 
+The CLI and SDK share the graph JSON format and the same DAG topology analyzer.
+The CLI catches structural graph failures (invalid ARC wiring, cycles, and dead
+nodes) and presents the pinned `operator@version` bindings. It intentionally
+does not duplicate the project's Rust `Registry`: the SDK `compile()` call is
+the authoritative check for operator resolution, schema compatibility, and
+effect capabilities. Project code remains the only place that executes those
+operators.
+
 ## Core model
 
 Keep six first-class concepts: `Graph`, `Node`, `Operator`, `ARC`, `Event`, and
@@ -53,10 +63,10 @@ concepts; they are not additional top-level subsystems in the MVP.
 
 - `Graph`: authoring structure of nodes, directed edges, graph identity/version,
   and declared input/output contracts.
-- `Node`: stable ID, operator binding, input ARC bindings, output ARC bindings,
-  selector/iterator policy, and optional lifecycle policy. A node is data-oriented
-  or control-oriented by its declared contract, not by introducing many node
-  subclasses.
+- `Node`: stable ID, exact operator name/version binding, one output ARC, one or
+  more input ARC bindings, and selector/iterator policy. The same node shape can bind operators
+  that transform data or emit bounded control events; lifecycle transitions stay
+  in the state-machine policy.
 - `Operator`: project-provided implementation plus stable name/version, input
   and output contracts, and effect/replay declarations.
 - `ARC`: a versioned data artifact with ID, schema, and payload or payload
@@ -73,13 +83,54 @@ change execution identity.
 
 ## Execution and data flow
 
-The compiler derives a deterministic topological order and exact ARC dependency
-sets. For every node, graph topology, data dependency, and runtime scheduling
-dependency must agree. A node reads only ARC references declared as its inputs
-and writes only its declared outputs. There is no general `arc.get(anything)` /
-`arc.set(anything)` shared-memory API.
+The compiler derives deterministic topological waves and exact ARC dependency
+sets. Nodes in one wave form a ready antichain: all their predecessors have
+completed, and they have no dependency on each other. For every node, graph
+topology, data dependency, and runtime scheduling dependency must agree. A node
+reads only ARC references declared as its inputs and writes only its declared
+output. There is no general `arc.get(anything)` / `arc.set(anything)` shared-
+memory API.
 
-The standard data node path is:
+### Concurrency contract
+
+The single-process Runtime supports opt-in, bounded parallel execution of
+independent nodes. `max_parallelism` defaults to `1`; callers can raise it
+explicitly. The compiler divides the stable topological order into waves. Within
+each wave the Runtime dispatches nodes in node-ID order, runs no more than the
+configured worker limit at once, and waits for the whole wave before advancing.
+This wave barrier favors predictable failure and journal semantics over
+work-stealing or minimum latency. Physical worker start/completion timing may
+still vary.
+
+Each worker receives cloned input ARC values and immutable compiled node/operator
+references. It cannot access or mutate the shared ARC store, schedule another
+node, or change topology. It returns a node outcome and private event facts. The
+coordinator commits outputs and appends journal facts in stable node-ID order;
+parallel completion timing never determines journal order or the selected
+primary error. Operators and hooks may be called concurrently and therefore
+must be safe for concurrent calls; the existing `Send + Sync` trait bound is
+part of that contract.
+
+If a node fails, the Runtime lets every already-dispatched node in that wave
+finish, records each outcome in stable order, calls error hooks in stable order,
+and does not start later waves. The primary execution error is the failure of
+the lowest node ID in that wave (unless its error hook fails, which is reported
+as a hook error). Successful sibling ARC writes remain journaled, but no
+downstream node consumes them in the failed execution. A cancellation request
+does not interrupt a running operator: the current wave drains, then cancellation
+is observed before the next wave or successful execution completion. Thus
+effect operators already running may complete even if a sibling fails or
+cancellation is requested. Use explicit ARC
+dependencies to serialize nodes that touch a shared external resource; declared
+capabilities do not provide resource locks.
+
+The journal is a deterministic logical record, not a wall-clock trace: it orders
+wave scheduling events, then each node's local events by node ID. It intentionally
+does not claim to preserve physical start/completion timing. Distributed
+scheduling, work stealing, per-item parallel iteration, and automatic retries
+remain out of scope.
+
+The current JSON value path for a data node is:
 
 ```text
 declared input ARCs → input selector → iterator → operator → output selector
@@ -108,16 +159,22 @@ compiled graph.
 
 ## Compile-time and runtime boundary
 
-Runtime never executes raw YAML/JSON or an authoring `Graph`. Compilation owns:
+Runtime never executes raw YAML/JSON or an authoring `Graph`. Compilation accepts
+the typed Rust `Graph` or parses its JSON representation, then owns:
 
 1. Parse and structural/schema validation.
-2. Operator name/version resolution against the supplied registry.
+2. Exact operator name/version resolution against the supplied registry.
 3. Operator and ARC schema/contract compatibility checks.
 4. Edge endpoint validation and cycle rejection.
 5. Reachability/dead-node analysis under an explicit graph entry/exit contract.
 6. ARC read/write grant validation against graph edges and node declarations.
-7. Capability and state-machine transition validation.
-8. Canonicalization, graph version/fingerprint, and freeze into `CompiledGraph`.
+7. Capability validation. The standalone `StateMachine::new` helper validates
+   its own declared state/transition table; it is not currently embedded in the
+   Graph or validated as part of `compile`.
+8. Preserve the declared graph ID/version and freeze into `CompiledGraph`.
+
+YAML parsing and cryptographic graph fingerprints are deferred. Graph identity
+uses the explicit version supplied by the design owner.
 
 Compilation returns explicit diagnostics on failure and an immutable compiled
 value on success. The runtime accepts only that value. Runtime behavior cannot
@@ -130,21 +187,30 @@ Execution lifecycle is separate from graph topology. Events report facts such as
 `ExecutionStarted`, `NodeScheduled`, `NodeStarted`, `ArcRead`, `OperatorStarted`,
 `OperatorCompleted`, `ArcWritten`, `NodeCompleted`, `NodeFailed`,
 `StateChanged`, `Cancelled`, and terminal execution outcomes. Payloads stay in
-ARCs; events carry references, IDs, versions, timestamps, and bounded metadata.
+ARCs; events carry references, IDs, versions, and bounded metadata. Error text
+stays on the returned failure value; control events carry only classification.
 
-The execution journal is append-only and is the record of what happened. Current
-state is a projection of accepted events, not a second mutable truth. A journal
-entry should bind the stable identity, graph fingerprint, node/operator version,
-input/output ARC references, event sequence, and error classification as
+The runtime returns an ordered in-memory journal of execution facts on success
+and failure. Its vector order is the event sequence; persistence is left to the
+caller in this MVP. State is derived from state-machine transitions, not stored
+as a separately mutable journal projection. Events bind execution identity,
+graph ID/version, node/operator version, ARC references, and error kind as
 applicable. Errors remain explicit and classifiable as graph, input, operator,
-output, transition, or effect errors.
+output, transition, effect, cancellation, or hook errors.
 
-MVP retry policy is deliberately bounded: pure operations may be replayed from
-the same compiled graph and input ARC versions. Effect operations declare
-whether they are replayable, idempotent, non-replayable, or require confirmation.
-The runtime must not blindly retry an uncertain external side effect. Durable
-checkpoint storage, distributed replay, and exactly-once effects are not MVP
-claims.
+`OperatorStarted` and `OperatorCompleted` correspond to actual
+`Operator::execute` calls. Whole-value execution uses a missing invocation
+index; item iteration records the original input-array index for each selected
+item that reaches the operator. Empty or fully filtered item input emits no
+operator invocation facts, while the node itself can still complete with an
+empty output array.
+
+MVP retry orchestration belongs to the caller's state machine: one call to
+`Runtime::run` is one attempt, and retry starts another call with new execution
+and attempt IDs. Effect operations declare whether they are replayable,
+idempotent, non-replayable, or require confirmation; the runtime records that
+declaration but does not retry automatically. Durable checkpoint storage,
+distributed replay, and exactly-once effects are not MVP claims.
 
 Hooks are observational and bounded to `before_node`, `after_node`, and
 `on_error`. Hooks cannot mutate graph topology, ARC grants, lifecycle state, or
@@ -158,7 +224,8 @@ failed execution into success.
 
 - Operator registry and stable operator metadata/version.
 - Graph authoring model and compiler to immutable `CompiledGraph`.
-- DAG validation, deterministic topological scheduling, and dead-node checks.
+- DAG validation, deterministic topological waves, bounded parallel scheduling,
+  and dead-node checks. Parallelism is opt-in; the default worker limit is one.
 - In-memory ARC store with per-node read/write grants and schema/version refs.
 - Data nodes, shared selector mechanism, and a small set of iterator modes.
 - Bounded control events, stable execution identity, and declarative state
@@ -167,7 +234,9 @@ failed execution into success.
   journal exposed to callers.
 - Basic node hooks, declared effect capabilities, cancel/failure outcomes, and
   explicit attempt identity for retry demonstrations.
-- Three executable demos described below.
+- Four executable demos described below.
+- A concurrency demo proving independent nodes overlap while dependent nodes wait
+  for the next wave and the journal remains stable.
 
 ### Excluded
 
@@ -192,6 +261,9 @@ without an MVP caller that proves they are needed.
    Demonstrate pure/effect operators in one graph, declared capabilities,
    effect journaling, and explicit replay behavior. Use a temporary demo-owned
    file and clean it up within the demo.
+4. **Concurrent pipeline**: independent sibling nodes with a dependent join.
+   Demonstrate bounded overlap, wave barriers, stable ARC/journal ordering, and
+   sibling-drain behavior on failure.
 
 ## Invariant-led acceptance
 
@@ -208,28 +280,27 @@ do not expose graph mutation or arbitrary scheduling. Failure and cancellation
 must produce observable terminal facts, and uncertain effects must not be
 silently retried.
 
-The three demos are executable acceptance paths, not documentation-only
+The four demos are executable acceptance paths, not documentation-only
 examples. Tests should focus on externally observable invariants and outcomes,
 not private scheduler implementation details.
 
 ## Implementation sequence and ownership
 
-This document records design intent only; it does not add code to AppSDK or
-select AppSDK as the runtime owner. Before implementation, establish a standalone
-component repository/worktree and choose its implementation language from the
-actual target and distribution constraints. Preserve the dependency boundary:
-the framework must run without AppSDK installed.
+This document records the standalone component design. Implementation lives in
+the `DAGpipe` Rust 2021 crate and has no AppSDK dependency. The AppSDK design tree
+does not own the runtime implementation; a future integration would consume the
+crate through an adapter.
 
 Implementation order:
 
-1. Lock the public core model and compiled graph contract.
-2. Implement compiler validation and invariant tests.
-3. Implement ARC grants, deterministic in-memory scheduler, and data operators.
-4. Add identity, events, state transitions, failure/cancel, and attempt semantics.
-5. Add bounded hooks and capability enforcement.
-6. Finish all three demos and their acceptance evidence.
-7. Review the public API for unnecessary concepts before considering persistence,
-   checkpoint recovery, or AppSDK integration.
+1. Current cut: lock public model, compiler, ARC grants, deterministic bounded
+   scheduler, identity/events/state-machine helper, bounded hooks, capabilities,
+   and demos.
+2. Document the public authoring and run path, including concurrency and effect
+   ordering semantics, and provide a project-local usage skill.
+3. Verify invariant tests and executable examples from the isolated candidate.
+4. Review the public API before considering persistence, checkpoint recovery, or
+   AppSDK integration.
 
 Completion means the standalone component can be imported and used by a small
 project that registers operators, compiles a graph, runs it, reads ARC results,

@@ -1,0 +1,33 @@
+{
+  "id": "project-normalization",
+  "version": "1",
+  "inputs": [
+    { "id": "records", "schema": "Array" }
+  ],
+  "nodes": [
+    {
+      "id": "normalize",
+      "operator": "normalize",
+      "operator_version": "1",
+      "inputs": ["records"],
+      "output": { "id": "normalized", "schema": "Array" },
+      "input_selector": { "include": [], "exclude": [], "predicate": null },
+      "output_selector": { "include": [], "exclude": [], "predicate": null },
+      "iterator": "Whole"
+    },
+    {
+      "id": "validate",
+      "operator": "validate",
+      "operator_version": "2",
+      "inputs": ["normalized"],
+      "output": { "id": "validated", "schema": "Array" },
+      "input_selector": { "include": [], "exclude": [], "predicate": null },
+      "output_selector": { "include": [], "exclude": [], "predicate": null },
+      "iterator": "Whole"
+    }
+  ],
+  "edges": [
+    { "from": "normalize", "to": "validate", "arc_id": "normalized" }
+  ],
+  "outputs": ["validated"]
+}

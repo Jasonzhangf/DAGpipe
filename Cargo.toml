@@ -1,6 +1,14 @@
 [package]
 name = "pipeline_runtime"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+description = "Deterministic DAG runtime SDK with a graph governance CLI"
+repository = "https://github.com/Jasonzhangf/DAGpipe"
+
+[[bin]]
+name = "dagpipe"
+path = "src/bin/dagpipe.rs"
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
