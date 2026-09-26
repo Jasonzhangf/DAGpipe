@@ -91,6 +91,36 @@ reads only ARC references declared as its inputs and writes only its declared
 output. There is no general `arc.get(anything)` / `arc.set(anything)` shared-
 memory API.
 
+### SESE module boundary and per-object audit
+
+Project-internal organization is not constrained to be a DAG: a module may use
+whatever implementation structure it needs. The project's externally exposed
+module/object dependencies are represented as a DAG. That boundary follows
+SESE (Single Entry, Single Exit): each audited Graph represents one object or
+feature flow and declares exactly one input ARC and exactly one output ARC. When
+auditing a project with multiple object sources, traverse every source and
+validate its corresponding Graph separately; do not combine independent flows
+into a multi-entry/multi-exit Graph. Internal module details are opaque to this
+external graph and must not be expanded into function-call nodes merely to
+satisfy DAG validation.
+
+Branching and joining are valid within the Graph, while a second entry or exit
+is rejected. Every Node must be reachable from the sole declared source and
+must reach the sole declared output.
+Each exposed Node is one module boundary with one execution entry and one
+declared output ARC; multiple input ARCs are bundled into that single Operator
+invocation rather than modeled as multiple control-flow entries. Its internal
+implementation may still contain loops, early returns, or state machines.
+The Runtime follows only this compiled external DAG and does not add synthetic
+routing Nodes or merge independent object flows implicitly.
+
+```text
+项目审计：逐对象遍历
+  对象 ARC A ──► A 的 SESE DAG（可分支/汇合）──► A 的唯一出口 ARC
+  对象 ARC B ──► B 的 SESE DAG（可分支/汇合）──► B 的唯一出口 ARC
+                （各模块内部实现不要求是 DAG）
+```
+
 ### Concurrency contract
 
 The single-process Runtime supports opt-in, bounded parallel execution of

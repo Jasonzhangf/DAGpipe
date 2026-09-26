@@ -23,7 +23,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         }
         ["modules", "list"] => {
             println!("graph.inspect\tinspect DAG topology and operator bindings");
-            println!("graph.validate\tvalidate acyclicity and output reachability");
+            println!("graph.validate\tvalidate external DAG with one input and output (SESE)");
             println!("skill.install\tinstall the packaged project-usage skill");
             Ok(())
         }
@@ -168,7 +168,9 @@ Usage:\n\
   dagpipe sdk path\n\
   dagpipe skill install\n\
   dagpipe --version\n\n\
-The CLI validates and inspects graph topology and operator bindings.\n\
+The CLI validates one external object flow per SESE Graph and inspects\n\
+operator bindings. Validate each project source as a separate Graph.\n\
+Project module internals need not themselves be DAGs.\n\
 Projects compile and execute their registered Operators through the Rust SDK."
     );
 }

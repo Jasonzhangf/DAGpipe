@@ -48,11 +48,17 @@ dagpipe graph validate examples/governance_graph.json
 dagpipe graph inspect examples/governance_graph.json
 ```
 
-CLI validation checks DAG acyclicity and that every node can reach a declared
-output. Inspection lists each node's `operator@version` binding and deterministic
-topological waves. These commands do not prove that the project has registered
-those Operators or that schemas/effects match; the project's SDK `compile()` is
-the authoritative gate for those contracts.
+CLI validation checks DAG acyclicity, that every node can reach the declared
+output, and that each Graph has exactly one source/input ARC and one output ARC
+(SESE). The source ARC's schema remains project-defined; SESE does not require a
+JSON object payload. Audit multi-object projects by validating a separate Graph
+for every business-object source. This constrains the externally exposed module
+dependency DAG; project-internal module implementation need not itself be a
+DAG. Inspection lists each node's `operator@version` binding and deterministic
+topological waves. These commands
+do not prove that the project has registered those Operators or that
+schemas/effects match; the project's SDK `compile()` is the authoritative gate
+for those contracts.
 
 Run the executable examples:
 

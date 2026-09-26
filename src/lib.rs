@@ -189,6 +189,11 @@ pub fn graph_topology(graph: &Graph) -> Result<GraphTopology, CompileError> {
             )));
         }
     }
+    if input_ids.len() != 1 {
+        return Err(CompileError::new(
+            "an audited SESE Graph must declare exactly one input ARC; validate each object flow as a separate Graph".into(),
+        ));
+    }
     let mut nodes = BTreeSet::new();
     let mut output_owner = HashMap::new();
     for node in &graph.nodes {
@@ -249,6 +254,11 @@ pub fn graph_topology(graph: &Graph) -> Result<GraphTopology, CompileError> {
             "graph declares a duplicate output ARC".into(),
         ));
     }
+    if output_ids.len() != 1 {
+        return Err(CompileError::new(
+            "an audited SESE Graph must declare exactly one output ARC; validate each object flow as a separate Graph".into(),
+        ));
+    }
     for output in &graph.outputs {
         if !output_owner.contains_key(output) {
             return Err(CompileError::new(format!(
@@ -260,6 +270,7 @@ pub fn graph_topology(graph: &Graph) -> Result<GraphTopology, CompileError> {
     let mut incoming: HashMap<NodeId, usize> =
         nodes.iter().cloned().map(|node| (node, 0)).collect();
     let mut dependents = HashMap::<NodeId, Vec<NodeId>>::new();
+    let mut predecessors = HashMap::<NodeId, Vec<NodeId>>::new();
     let mut edge_keys = BTreeSet::new();
     for edge in &graph.edges {
         if !nodes.contains(&edge.from) {
@@ -307,7 +318,12 @@ pub fn graph_topology(graph: &Graph) -> Result<GraphTopology, CompileError> {
             .entry(edge.from.clone())
             .or_default()
             .push(edge.to.clone());
+        predecessors
+            .entry(edge.to.clone())
+            .or_default()
+            .push(edge.from.clone());
     }
+    let mut external_consumers = HashMap::<ArcId, Vec<NodeId>>::new();
     for node in &graph.nodes {
         for input in &node.inputs {
             if output_owner.contains_key(input) {
@@ -322,6 +338,11 @@ pub fn graph_topology(graph: &Graph) -> Result<GraphTopology, CompileError> {
                     "node `{}` reads undeclared ARC `{input}`",
                     node.id
                 )));
+            } else {
+                external_consumers
+                    .entry(input.clone())
+                    .or_default()
+                    .push(node.id.clone());
             }
         }
     }
@@ -356,20 +377,56 @@ pub fn graph_topology(graph: &Graph) -> Result<GraphTopology, CompileError> {
         return Err(CompileError::new("graph contains a cycle".into()));
     }
 
+    for source in &graph.inputs {
+        let mut pending = external_consumers
+            .get(&source.id)
+            .cloned()
+            .unwrap_or_default();
+        if pending.is_empty() {
+            return Err(CompileError::new(format!(
+                "source ARC `{}` is not consumed by any node",
+                source.id
+            )));
+        }
+        let mut reachable = BTreeSet::new();
+        while let Some(node) = pending.pop() {
+            if reachable.insert(node.clone()) {
+                if let Some(children) = dependents.get(&node) {
+                    pending.extend(children.iter().cloned());
+                }
+            }
+        }
+        let reached_outputs: Vec<_> = graph
+            .outputs
+            .iter()
+            .filter(|arc| {
+                output_owner
+                    .get(*arc)
+                    .is_some_and(|owner| reachable.contains(owner))
+            })
+            .collect();
+        if reached_outputs.len() != 1 {
+            return Err(CompileError::new(format!(
+                "source ARC `{}` reaches {} graph outputs; each source must reach exactly one",
+                source.id,
+                reached_outputs.len()
+            )));
+        }
+    }
+
     let mut can_reach_output: BTreeSet<NodeId> = graph
         .outputs
         .iter()
         .filter_map(|arc| output_owner.get(arc).cloned())
         .collect();
-    loop {
-        let previous = can_reach_output.len();
-        for edge in &graph.edges {
-            if can_reach_output.contains(&edge.to) {
-                can_reach_output.insert(edge.from.clone());
+    let mut pending: Vec<_> = can_reach_output.iter().cloned().collect();
+    while let Some(node) = pending.pop() {
+        if let Some(parents) = predecessors.get(&node) {
+            for parent in parents {
+                if can_reach_output.insert(parent.clone()) {
+                    pending.push(parent.clone());
+                }
             }
-        }
-        if previous == can_reach_output.len() {
-            break;
         }
     }
     if let Some(dead) = nodes.iter().find(|id| !can_reach_output.contains(*id)) {
@@ -1990,6 +2047,20 @@ mod tests {
                 iterator: IteratorKind::Whole,
             })
             .collect();
+        let mut nodes = nodes;
+        nodes.push(Node {
+            id: "join".into(),
+            operator: "copy".into(),
+            operator_version: "1".into(),
+            inputs: vec!["output-0".into(), "output-1".into(), "output-2".into()],
+            output: ArcContract {
+                id: "result".into(),
+                schema: ValueType::Array,
+            },
+            input_selector: Selector::default(),
+            output_selector: Selector::default(),
+            iterator: IteratorKind::Whole,
+        });
         let graph = Graph {
             id: "bounded-parallelism".into(),
             version: "1".into(),
@@ -1998,9 +2069,14 @@ mod tests {
                 schema: ValueType::Object,
             }],
             nodes,
-            edges: Vec::new(),
-            outputs: vec!["output-0".into(), "output-1".into(), "output-2".into()],
+            edges: vec![
+                edge("node-0", "join", "output-0"),
+                edge("node-1", "join", "output-1"),
+                edge("node-2", "join", "output-2"),
+            ],
+            outputs: vec!["result".into()],
         };
+        operators.register(CopyOp).unwrap();
         let compiled = compile(graph.clone(), &operators, &BTreeSet::new()).unwrap();
         Runtime::new(BTreeSet::new())
             .with_max_parallelism(NonZeroUsize::new(2).unwrap())
@@ -2490,6 +2566,40 @@ mod tests {
     }
 
     #[test]
+    fn graph_topology_requires_a_sese_graph_per_object_source() {
+        assert!(graph_topology(&simple_graph()).is_ok());
+
+        let mut scalar_payload = simple_graph();
+        scalar_payload.inputs[0].schema = ValueType::String;
+        assert!(graph_topology(&scalar_payload).is_ok());
+
+        let mut multiple_sources = simple_graph();
+        multiple_sources.inputs.push(ArcContract {
+            id: "object-b".into(),
+            schema: ValueType::Object,
+        });
+        assert!(graph_topology(&multiple_sources)
+            .unwrap_err()
+            .message
+            .contains("exactly one input ARC; validate each object flow as a separate Graph"));
+
+        let mut multiple_sinks = simple_graph();
+        let mut extra_sink = multiple_sinks.nodes[0].clone();
+        extra_sink.id = "extra-sink".into();
+        extra_sink.inputs = vec!["result".into()];
+        extra_sink.output.id = "extra-result".into();
+        multiple_sinks.nodes.push(extra_sink);
+        multiple_sinks
+            .edges
+            .push(edge("copy-node", "extra-sink", "result"));
+        multiple_sinks.outputs.push("extra-result".into());
+        assert!(graph_topology(&multiple_sinks)
+            .unwrap_err()
+            .message
+            .contains("exactly one output ARC; validate each object flow as a separate Graph"));
+    }
+
+    #[test]
     fn json_parse_rejects_invalid_graph_shape() {
         assert!(parse_graph_json("{\"nodes\": [}")
             .unwrap_err()
@@ -2726,19 +2836,25 @@ mod tests {
     #[test]
     fn whole_node_multi_arc_contract_matches_runtime_array_bundle() {
         let mut graph = simple_graph();
-        graph.inputs = vec![
-            ArcContract {
-                id: "left".into(),
-                schema: ValueType::Object,
-            },
-            ArcContract {
-                id: "right".into(),
-                schema: ValueType::Object,
-            },
+        let mut left = graph.nodes[0].clone();
+        left.id = "left".into();
+        left.output.id = "left-output".into();
+        let mut right = left.clone();
+        right.id = "right".into();
+        right.output.id = "right-output".into();
+        let mut join = left.clone();
+        join.id = "join".into();
+        join.operator = "object_only".into();
+        join.inputs = vec!["left-output".into(), "right-output".into()];
+        join.output.id = "result".into();
+        join.output.schema = ValueType::Object;
+        graph.nodes = vec![left, right, join];
+        graph.edges = vec![
+            edge("left", "join", "left-output"),
+            edge("right", "join", "right-output"),
         ];
-        graph.nodes[0].inputs = vec!["left".into(), "right".into()];
-        graph.nodes[0].operator = "object_only".into();
         let mut object_registry = Registry::default();
+        object_registry.register(CopyOp).unwrap();
         object_registry.register(ObjectOnly).unwrap();
         let error = compile(graph.clone(), &object_registry, &BTreeSet::new()).unwrap_err();
         assert!(
@@ -2746,23 +2862,21 @@ mod tests {
             "{error}"
         );
 
-        graph.nodes[0].operator = "array_only".into();
-        graph.nodes[0].output.schema = ValueType::Array;
+        graph.nodes[2].operator = "array_only".into();
+        graph.nodes[2].output.schema = ValueType::Array;
         let mut array_registry = Registry::default();
+        array_registry.register(CopyOp).unwrap();
         array_registry.register(ArrayOnly).unwrap();
         let compiled = compile(graph.clone(), &array_registry, &BTreeSet::new()).unwrap();
         let result = Runtime::new(BTreeSet::new())
             .run(
                 &compiled,
                 identity(&graph),
-                HashMap::from([
-                    ("left".into(), json!({"v":1})),
-                    ("right".into(), json!({"v":2})),
-                ]),
+                HashMap::from([("source".into(), json!({"v":1}))]),
                 &Cancellation::default(),
             )
             .unwrap();
-        assert_eq!(result.outputs["result"].payload, json!([{"v":1},{"v":2}]));
+        assert_eq!(result.outputs["result"].payload, json!([{"v":1},{"v":1}]));
     }
 
     #[test]

@@ -35,8 +35,13 @@ dagpipe graph validate examples/governance_graph.json
 dagpipe graph inspect examples/governance_graph.json
 ```
 
-`validate` checks the static DAG is acyclic and every node can reach a declared
-output. `inspect` reports `operator@version` bindings, deterministic execution
+`validate` checks the external dependency DAG is acyclic, every node can reach
+a declared output, and each Graph declares exactly one source/input ARC and one
+output ARC (SESE). The input ARC schema is project-defined; a business-object
+source does not have to be a JSON object payload. Validate each project's
+business-object source as a separate Graph. The project's internal module
+implementation is not required to be a DAG. `inspect` reports `operator@version`
+bindings, deterministic execution
 waves, and ARC edges. These checks are governance evidence only: they do not
 resolve the project's Rust `Registry`, Operator contracts, or capabilities.
 The project's `compile(graph, &registry, &capabilities)` remains the complete

@@ -42,7 +42,13 @@ reason instead of silently omitting them.
 - **DAG and data contracts:** define the graph's trigger, nodes, dependency
   edges, ARC inputs/outputs, declared outputs, and success/failure/cancel
   terminals. Show which event or state transition starts the graph and how its
-  result is consumed.
+  result is consumed. For project audits, enumerate every business object
+  source and validate its flow separately as a SESE Graph (one entry ARC, one
+  exit ARC); the ARC payload schema is project-defined, not necessarily a JSON
+  object. Do not combine independent sources into a multi-entry graph.
+  Project-internal module implementation need not be a DAG; keep each graph at
+  the exposed module/object dependency boundary rather than expanding functions
+  into graph nodes.
 - **Change boundary:** name the exact in-scope modules/files and callers to
   change, the out-of-scope neighboring systems/files, required compatibility
   or migration behavior, dependencies, and the tests/evidence that accept the
@@ -145,9 +151,11 @@ dagpipe graph validate path/to/graph.json
 dagpipe graph inspect path/to/graph.json
 ```
 
-The CLI checks static topology, output reachability, deterministic waves, ARC
-edges, and declared `operator@version` bindings. It intentionally cannot see
-the consuming project's Rust Registry or prove its contracts/capabilities.
+The CLI checks static topology, one declared source/input ARC and output ARC
+per Graph (SESE), deterministic waves, ARC edges, and declared
+`operator@version` bindings. It
+intentionally cannot see the consuming project's Rust Registry or prove its
+contracts/capabilities.
 
 ### Add and run the SDK
 

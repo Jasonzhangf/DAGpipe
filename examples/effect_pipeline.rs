@@ -17,10 +17,10 @@ impl Operator for ReadFile {
         "1"
     }
     fn input_type(&self) -> ValueType {
-        ValueType::String
+        ValueType::Object
     }
     fn output_type(&self) -> ValueType {
-        ValueType::String
+        ValueType::Object
     }
     fn effects(&self) -> &'static [&'static str] {
         &["filesystem.read"]
@@ -29,10 +29,17 @@ impl Operator for ReadFile {
         EffectReplay::NonReplayable
     }
     fn execute(&self, input: Value, _: &OperatorContext) -> Result<Value, String> {
-        let path = input.as_str().ok_or("path must be a string")?;
-        fs::read_to_string(path)
-            .map(Value::String)
-            .map_err(|error| error.to_string())
+        let request = input.as_object().ok_or("request must be an object")?;
+        let path = request
+            .get("source_path")
+            .and_then(Value::as_str)
+            .ok_or("source_path must be a string")?;
+        let output_path = request
+            .get("output_path")
+            .and_then(Value::as_str)
+            .ok_or("output_path must be a string")?;
+        let contents = fs::read_to_string(path).map_err(|error| error.to_string())?;
+        Ok(json!({"output_path": output_path, "contents": contents}))
     }
 }
 
@@ -45,15 +52,19 @@ impl Operator for Uppercase {
         "1"
     }
     fn input_type(&self) -> ValueType {
-        ValueType::String
+        ValueType::Object
     }
     fn output_type(&self) -> ValueType {
-        ValueType::String
+        ValueType::Object
     }
     fn execute(&self, input: Value, _: &OperatorContext) -> Result<Value, String> {
-        Ok(Value::String(
-            input.as_str().ok_or("expected string")?.to_uppercase(),
-        ))
+        let mut result = input.as_object().cloned().ok_or("expected object")?;
+        let contents = result
+            .get("contents")
+            .and_then(Value::as_str)
+            .ok_or("contents must be a string")?;
+        result.insert("contents".into(), Value::String(contents.to_uppercase()));
+        Ok(Value::Object(result))
     }
 }
 
@@ -72,13 +83,13 @@ impl Operator for WriteFile {
         EffectReplay::RequiresConfirmation
     }
     fn execute(&self, input: Value, _: &OperatorContext) -> Result<Value, String> {
-        let args = input.as_array().ok_or("expected [path, content]")?;
+        let args = input.as_object().ok_or("expected object")?;
         let path = args
-            .first()
+            .get("output_path")
             .and_then(Value::as_str)
             .ok_or("missing output path")?;
         let content = args
-            .get(1)
+            .get("contents")
             .and_then(Value::as_str)
             .ok_or("missing content")?;
         let mut file = OpenOptions::new()
@@ -171,29 +182,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let graph = Graph {
         id: "effect-pipeline".into(),
         version: "1".into(),
-        inputs: vec![
-            arc("source_path", ValueType::String),
-            arc("output_path", ValueType::String),
-        ],
+        inputs: vec![arc("request", ValueType::Object)],
         nodes: vec![
             node(
                 "read",
                 "read_file",
-                &["source_path"],
+                &["request"],
                 "contents",
-                ValueType::String,
+                ValueType::Object,
             ),
             node(
                 "transform",
                 "uppercase",
                 &["contents"],
                 "transformed",
-                ValueType::String,
+                ValueType::Object,
             ),
             node(
                 "write",
                 "write_file",
-                &["output_path", "transformed"],
+                &["transformed"],
                 "written",
                 ValueType::Object,
             ),
@@ -233,10 +241,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             execution_id: "effect-1".into(),
             attempt_id: "attempt-1".into(),
         },
-        HashMap::from([
-            ("source_path".into(), json!(area.source.to_string_lossy())),
-            ("output_path".into(), json!(area.output.to_string_lossy())),
-        ]),
+        HashMap::from([(
+            "request".into(),
+            json!({
+                "source_path": area.source.to_string_lossy(),
+                "output_path": area.output.to_string_lossy(),
+            }),
+        )]),
         &Cancellation::default(),
     )?;
     assert_eq!(fs::read_to_string(&area.output)?, "DAG RUNTIME\n");
