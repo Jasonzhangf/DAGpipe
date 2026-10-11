@@ -150,6 +150,66 @@ the failed/cancelled terminal fact. A retry is a new `Runtime::run` call with a
 new `execution_id` and `attempt_id`; the Runtime never loops a DAG or silently
 retries effects.
 
+## Run an async graph
+
+Use `AsyncOperator` when one node must await work before it writes its ARC.
+Async operators use the same name/version, input/output, ARC grant, event, and
+effect checks as synchronous operators:
+
+```rust
+use pipeline_runtime::{
+    AsyncOperator, Cancellation, OperatorContext, OperatorFailure, Registry, Runtime, ValueType,
+};
+use serde_json::Value;
+use std::future::Future;
+use std::pin::Pin;
+
+struct AwaitPolicy;
+
+impl AsyncOperator for AwaitPolicy {
+    fn name(&self) -> &'static str { "await-policy" }
+    fn version(&self) -> &'static str { "1" }
+    fn input_type(&self) -> ValueType { ValueType::Object }
+    fn output_type(&self) -> ValueType { ValueType::Object }
+
+    fn execute<'a>(
+        &'a self,
+        input: Value,
+        _: OperatorContext,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, OperatorFailure>> + Send + 'a>> {
+        Box::pin(async move {
+            // Await the project's real policy future here.
+            Ok(input)
+        })
+    }
+}
+
+let mut registry = Registry::default();
+registry.register_async(AwaitPolicy)?;
+let compiled = compile(graph, &registry, &allowed_effects)?;
+let cancellation = Cancellation::default();
+let mut execution = Runtime::new(allowed_effects)
+    .start_async(&compiled, identity, inputs, cancellation.clone())?;
+let journal = execution.journal_handle();
+
+// Poll `execution` with the caller's real executor. `Runtime` does not call
+// `block_on`, create a second scheduler, or spawn detached work.
+let result = execution.await;
+```
+
+`AsyncExecution` owns its child futures. Dropping it cancels and drops those
+futures synchronously, records `Event::ExecutionDropped`, and never invents
+completion events. A cloned `Cancellation` wakes a pending execution without a
+registration/cancel race. Each execution replaces its own registration on a
+new poll and removes it on success, failure, cancellation, or drop without
+clearing registrations owned by other executions. A cloned `JournalHandle`
+remains readable after the future is dropped and exposes only events that
+actually happened. A failure is an `AsyncExecutionFailure`; it retains the
+`RuntimeError` kind, an optional typed `OperatorFailure` cause, an optional
+separate hook cause, and the real journal. The original operator cause is not
+replaced when an `on_error` hook fails. `Runtime::run` rejects a graph containing
+async operators before running any node; use `start_async`.
+
 ## Concurrency and side effects
 
 Runtime defaults to one worker. Set `with_max_parallelism(NonZeroUsize)` to opt
@@ -207,14 +267,16 @@ cargo run --example data_pipeline
 cargo run --example control_lifecycle
 cargo run --example effect_pipeline
 cargo run --example concurrent_pipeline
+cargo run --example async_execution
 cargo clippy --all-targets -- -D warnings
 ```
 
 The concurrent demo uses a barrier so both independent operators must overlap
 to complete. It then joins their ARC outputs and prints the journal's stable
 scheduling order. Tests additionally verify bounded configuration, wave failure
-draining, stable error selection, and that dependent nodes do not start after a
-failed wave.
+draining, stable error selection, awaited async dependencies, cancellation
+wake-up, drop cleanup, typed async causes, and that dependent nodes do not start
+after a failed wave.
 
 This version is single-process and in-memory. It does not provide durable ARC or
 journal storage, checkpoint recovery, distributed workers, work stealing,
