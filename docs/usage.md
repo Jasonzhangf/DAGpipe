@@ -158,11 +158,13 @@ topological waves; independent siblings in a wave may overlap, while a node in a
 later wave waits for all predecessors. The worker limit is respected within
 each wave.
 
-The Runtime gives each worker cloned input ARC values and accepts outputs only
-after the wave drains. Journal events are ordered by wave and node ID, not by
-thread timing. Operators and `before_node`/`after_node` hooks can be invoked
-concurrently and must be safe for concurrent calls. `on_error` hooks run in
-stable node-ID order after the wave completes.
+The Runtime gives each worker an owned input ARC value: it moves a payload when
+the node is that ARC's last remaining reader and copies it only when another
+node still needs the same ARC. Outputs are accepted only after the wave drains.
+Journal events are ordered by wave and node ID, not by thread timing. Operators
+and `before_node`/`after_node` hooks can be invoked concurrently and must be
+safe for concurrent calls. `on_error` hooks run in stable node-ID order after
+the wave completes.
 
 If any node fails, all nodes in that already-scheduled wave finish; the Runtime
 records every outcome, chooses the lowest node ID's error as the primary error,

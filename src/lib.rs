@@ -122,9 +122,15 @@ impl Selector {
         if self.include.is_empty() && self.exclude.is_empty() {
             return Ok(Some(value));
         }
-        let mut object = value.as_object().cloned().ok_or_else(|| {
-            RuntimeError::new(ErrorKind::Input, "selector requires an object value")
-        })?;
+        let mut object = match value {
+            Value::Object(object) => object,
+            _ => {
+                return Err(RuntimeError::new(
+                    ErrorKind::Input,
+                    "selector requires an object value",
+                ))
+            }
+        };
         object.retain(|key, _| {
             (self.include.is_empty() || self.include.contains(key)) && !self.exclude.contains(key)
         });
@@ -909,7 +915,6 @@ impl Cancellation {
     }
 }
 
-#[derive(Clone)]
 struct NodeTask {
     node_id: NodeId,
     inputs: Result<Vec<(Value, String)>, RuntimeError>,
@@ -976,9 +981,10 @@ fn execute_node(
         });
     }
     if compiled.node.iterator == IteratorKind::Whole {
-        for value in &mut input_values {
-            match compiled.node.input_selector.apply(value.clone()) {
-                Ok(Some(selected)) => *value = selected,
+        let mut selected_values = Vec::with_capacity(input_values.len());
+        for value in input_values {
+            match compiled.node.input_selector.apply(value) {
+                Ok(Some(selected)) => selected_values.push(selected),
                 Ok(None) => {
                     return NodeOutcome::failed(
                         node_id,
@@ -992,6 +998,7 @@ fn execute_node(
                 Err(error) => return NodeOutcome::failed(node_id, events, error),
             }
         }
+        input_values = selected_values;
     }
     let input = if input_values.len() == 1 {
         input_values.remove(0)
@@ -1253,7 +1260,7 @@ impl Runtime {
         &self,
         graph: &CompiledGraph,
         identity: Identity,
-        inputs: HashMap<ArcId, Value>,
+        mut inputs: HashMap<ArcId, Value>,
         cancellation: &Cancellation,
     ) -> Result<ExecutionResult, ExecutionFailure> {
         if identity.project_id.is_empty()
@@ -1284,7 +1291,7 @@ impl Runtime {
         }];
         let mut arcs = HashMap::<ArcId, ArcValue>::new();
         for contract in &graph.inputs {
-            let payload = match inputs.get(&contract.id).cloned() {
+            let payload = match inputs.remove(&contract.id) {
                 Some(payload) => payload,
                 None => {
                     return Err(fail_execution(
@@ -1327,6 +1334,17 @@ impl Runtime {
                 journal,
             ));
         }
+        // Remaining readers per ARC: node input reads plus one retention read per
+        // declared graph output, so a terminal output is not moved away early.
+        let mut pending_reads: HashMap<&str, usize> = HashMap::new();
+        for node in graph.nodes.values() {
+            for arc_id in &node.node.inputs {
+                *pending_reads.entry(arc_id.as_str()).or_insert(0) += 1;
+            }
+        }
+        for output in &graph.outputs {
+            *pending_reads.entry(output.as_str()).or_insert(0) += 1;
+        }
         for wave in &graph.waves {
             if cancellation.is_cancelled() {
                 journal.push(Event::Cancelled);
@@ -1353,24 +1371,30 @@ impl Runtime {
                         .inputs
                         .iter()
                         .map(|arc_id| {
-                            arcs.get(arc_id)
-                                .map(|arc| {
-                                    (
-                                        arc.payload.clone(),
-                                        format!(
-                                            "arc://{}/{}@{}",
-                                            identity.execution_id, arc.id, arc.version
-                                        ),
-                                    )
-                                })
-                                .ok_or_else(|| {
+                            let remaining = pending_reads
+                                .get_mut(arc_id.as_str())
+                                .expect("input ARC has a consumer count");
+                            *remaining -= 1;
+                            let arc_ref = {
+                                let arc = arcs.get(arc_id).ok_or_else(|| {
                                     RuntimeError::new(
                                         ErrorKind::Input,
                                         format!(
                                             "ARC `{arc_id}` is not available to node `{node_id}`"
                                         ),
                                     )
-                                })
+                                })?;
+                                format!(
+                                    "arc://{}/{}@{}",
+                                    identity.execution_id, arc.id, arc.version
+                                )
+                            };
+                            let payload = if *remaining == 0 {
+                                arcs.remove(arc_id).expect("arc present").payload
+                            } else {
+                                arcs.get(arc_id).expect("arc present").payload.clone()
+                            };
+                            Ok((payload, arc_ref))
                         })
                         .collect::<Result<Vec<_>, _>>();
                     NodeTask {
@@ -1392,18 +1416,26 @@ impl Runtime {
                     ));
                 }
             } else {
-                for batch in tasks.chunks(self.max_parallelism.get()) {
+                let mut remaining = tasks.into_iter();
+                loop {
+                    let batch: Vec<NodeTask> = remaining
+                        .by_ref()
+                        .take(self.max_parallelism.get())
+                        .collect();
+                    if batch.is_empty() {
+                        break;
+                    }
                     let batch_outcomes = thread::scope(|scope| {
                         let handles: Vec<_> = batch
-                            .iter()
+                            .into_iter()
                             .map(|task| {
                                 let compiled =
                                     graph.nodes.get(&task.node_id).expect("compiled node");
-                                let task = task.clone();
+                                let node_id = task.node_id.clone();
                                 let identity = &identity;
                                 let capabilities = &self.capabilities;
                                 let hooks = &self.hooks;
-                                scope.spawn(move || {
+                                let handle = scope.spawn(move || {
                                     execute_node_guarded(
                                         compiled,
                                         task,
@@ -1411,16 +1443,16 @@ impl Runtime {
                                         capabilities,
                                         hooks,
                                     )
-                                })
+                                });
+                                (node_id, handle)
                             })
                             .collect();
                         handles
                             .into_iter()
-                            .zip(batch)
-                            .map(|(handle, task)| {
+                            .map(|(node_id, handle)| {
                                 handle.join().unwrap_or_else(|_| {
                                     NodeOutcome::failed(
-                                        task.node_id.clone(),
+                                        node_id,
                                         Vec::new(),
                                         RuntimeError::new(
                                             ErrorKind::Operator,
@@ -1484,12 +1516,7 @@ impl Runtime {
         let outputs = graph
             .outputs
             .iter()
-            .map(|id| {
-                (
-                    id.clone(),
-                    arcs.get(id).expect("compiled output exists").clone(),
-                )
-            })
+            .map(|id| (id.clone(), arcs.remove(id).expect("compiled output exists")))
             .collect();
         Ok(ExecutionResult {
             identity,
